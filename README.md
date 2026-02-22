@@ -18,6 +18,7 @@ NestJS workflow engine integrating XState v5 — machine registration, actor lif
 - [Persistence](#persistence)
 - [Events](#events)
 - [Async configuration](#async-configuration)
+- [Examples](#examples)
 - [API reference](#api-reference)
 - [License](#license)
 
@@ -280,6 +281,405 @@ XStateModule.forRootAsync({
   }),
   inject: [ConfigService],
 })
+```
+
+## Examples
+
+### Order fulfillment
+
+An e-commerce order that goes through payment, shipping, and delivery — with automatic retries on payment failure.
+
+```mermaid
+stateDiagram-v2
+    [*] --> draft
+    draft --> pending_payment : submit
+    pending_payment --> paid : payment_success
+    pending_payment --> payment_failed : payment_error
+    payment_failed --> pending_payment : retry
+    payment_failed --> cancelled : cancel
+    paid --> shipped : ship
+    shipped --> delivered : deliver
+    delivered --> [*]
+    draft --> cancelled : cancel
+    cancelled --> [*]
+```
+
+```ts
+// order.machine.ts
+import { setup, assign, fromPromise } from 'xstate';
+
+export const orderMachine = setup({
+  types: {
+    context: {} as { orderId: string; total: number; trackingNumber?: string },
+    events: {} as
+      | { type: 'submit' }
+      | { type: 'payment_success' }
+      | { type: 'payment_error'; error: string }
+      | { type: 'retry' }
+      | { type: 'ship'; trackingNumber: string }
+      | { type: 'deliver' }
+      | { type: 'cancel' },
+    input: {} as { orderId: string; total: number },
+  },
+  actors: {
+    processPayment: fromPromise(async ({ input }: { input: { orderId: string; total: number } }) => {
+      throw new Error('Provide via DI');
+    }),
+  },
+}).createMachine({
+  id: 'order',
+  initial: 'draft',
+  context: ({ input }) => ({ orderId: input.orderId, total: input.total }),
+  states: {
+    draft: {
+      on: {
+        submit: 'pending_payment',
+        cancel: 'cancelled',
+      },
+    },
+    pending_payment: {
+      invoke: {
+        src: 'processPayment',
+        input: ({ context }) => ({ orderId: context.orderId, total: context.total }),
+        onDone: 'paid',
+        onError: 'payment_failed',
+      },
+    },
+    payment_failed: {
+      on: {
+        retry: 'pending_payment',
+        cancel: 'cancelled',
+      },
+    },
+    paid: {
+      on: {
+        ship: {
+          target: 'shipped',
+          actions: assign({
+            trackingNumber: ({ event }) => event.trackingNumber,
+          }),
+        },
+      },
+    },
+    shipped: {
+      on: { deliver: 'delivered' },
+    },
+    delivered: { type: 'final' },
+    cancelled: { type: 'final' },
+  },
+});
+```
+
+```ts
+// order.module.ts
+import { Module } from '@nestjs/common';
+import { XStateModule } from '@opkod-france/nestjs-xstate';
+import { fromPromise } from 'xstate';
+import { orderMachine } from './order.machine';
+import { PaymentService } from './payment.service';
+
+@Module({
+  imports: [
+    XStateModule.forFeature({
+      machines: [
+        {
+          name: 'order',
+          machine: orderMachine,
+          implementations: (paymentService: PaymentService) => ({
+            actors: {
+              processPayment: fromPromise(({ input }) =>
+                paymentService.charge(input.orderId, input.total),
+              ),
+            },
+          }),
+          implementationDeps: [PaymentService],
+        },
+      ],
+    }),
+  ],
+  providers: [PaymentService],
+})
+export class OrderModule {}
+```
+
+```ts
+// order.controller.ts
+@Controller('orders')
+export class OrderController {
+  constructor(
+    @InjectActorFactory('order') private readonly orders: ActorFactory,
+  ) {}
+
+  @Post()
+  async create(@Body() body: { total: number }) {
+    const orderId = crypto.randomUUID();
+    await this.orders.getOrCreate(orderId, {
+      input: { orderId, total: body.total },
+    });
+    return { orderId };
+  }
+
+  @Post(':id/submit')
+  async submit(@Param('id') id: string) {
+    return this.orders.send(id, { type: 'submit' });
+  }
+
+  @Post(':id/ship')
+  async ship(@Param('id') id: string, @Body() body: { trackingNumber: string }) {
+    return this.orders.send(id, { type: 'ship', trackingNumber: body.trackingNumber });
+  }
+
+  @Get(':id')
+  async status(@Param('id') id: string) {
+    return this.orders.getSnapshot(id);
+  }
+}
+```
+
+---
+
+### Document approval workflow
+
+A multi-step approval pipeline where documents go through review, optional revision cycles, and final approval or rejection.
+
+```mermaid
+stateDiagram-v2
+    [*] --> draft
+    draft --> submitted : submit
+    submitted --> under_review : assign_reviewer
+    under_review --> changes_requested : request_changes
+    under_review --> approved : approve
+    under_review --> rejected : reject
+    changes_requested --> submitted : resubmit
+    approved --> [*]
+    rejected --> [*]
+```
+
+```ts
+// approval.machine.ts
+import { setup, assign } from 'xstate';
+
+export const approvalMachine = setup({
+  types: {
+    context: {} as {
+      documentId: string;
+      authorId: string;
+      reviewerId?: string;
+      comments: string[];
+    },
+    events: {} as
+      | { type: 'submit' }
+      | { type: 'assign_reviewer'; reviewerId: string }
+      | { type: 'approve'; comment?: string }
+      | { type: 'reject'; comment: string }
+      | { type: 'request_changes'; comment: string }
+      | { type: 'resubmit' },
+    input: {} as { documentId: string; authorId: string },
+  },
+}).createMachine({
+  id: 'approval',
+  initial: 'draft',
+  context: ({ input }) => ({
+    documentId: input.documentId,
+    authorId: input.authorId,
+    comments: [],
+  }),
+  states: {
+    draft: {
+      on: { submit: 'submitted' },
+    },
+    submitted: {
+      on: {
+        assign_reviewer: {
+          target: 'under_review',
+          actions: assign({
+            reviewerId: ({ event }) => event.reviewerId,
+          }),
+        },
+      },
+    },
+    under_review: {
+      on: {
+        approve: 'approved',
+        reject: {
+          target: 'rejected',
+          actions: assign({
+            comments: ({ context, event }) => [...context.comments, event.comment],
+          }),
+        },
+        request_changes: {
+          target: 'changes_requested',
+          actions: assign({
+            comments: ({ context, event }) => [...context.comments, event.comment],
+          }),
+        },
+      },
+    },
+    changes_requested: {
+      on: { resubmit: 'submitted' },
+    },
+    approved: { type: 'final' },
+    rejected: { type: 'final' },
+  },
+});
+```
+
+```ts
+// approval.module.ts
+@Module({
+  imports: [
+    XStateModule.forFeature([
+      { name: 'approval', machine: approvalMachine },
+    ]),
+  ],
+})
+export class ApprovalModule {}
+```
+
+```ts
+// Usage in a service
+@Injectable()
+export class ApprovalService {
+  constructor(
+    @InjectActorFactory('approval') private readonly approvals: ActorFactory,
+  ) {}
+
+  async startReview(documentId: string, authorId: string) {
+    await this.approvals.getOrCreate(documentId, {
+      input: { documentId, authorId },
+    });
+    return this.approvals.send(documentId, { type: 'submit' });
+  }
+
+  async assignReviewer(documentId: string, reviewerId: string) {
+    return this.approvals.send(documentId, {
+      type: 'assign_reviewer',
+      reviewerId,
+    });
+  }
+
+  async approve(documentId: string) {
+    return this.approvals.send(documentId, { type: 'approve' });
+  }
+
+  async requestChanges(documentId: string, comment: string) {
+    return this.approvals.send(documentId, {
+      type: 'request_changes',
+      comment,
+    });
+  }
+}
+```
+
+---
+
+### User onboarding
+
+A step-by-step onboarding flow that tracks profile completion, email verification, and guided tour — resumable across sessions with persistence.
+
+```mermaid
+stateDiagram-v2
+    [*] --> registered
+    registered --> profile_setup : start_onboarding
+    profile_setup --> email_verification : complete_profile
+    email_verification --> tour : verify_email
+    email_verification --> email_verification : resend_email
+    tour --> completed : finish_tour
+    tour --> completed : skip_tour
+    completed --> [*]
+```
+
+```ts
+// onboarding.machine.ts
+import { setup, assign } from 'xstate';
+
+export const onboardingMachine = setup({
+  types: {
+    context: {} as {
+      userId: string;
+      profileCompleted: boolean;
+      emailVerified: boolean;
+      tourCompleted: boolean;
+    },
+    events: {} as
+      | { type: 'start_onboarding' }
+      | { type: 'complete_profile' }
+      | { type: 'verify_email' }
+      | { type: 'resend_email' }
+      | { type: 'finish_tour' }
+      | { type: 'skip_tour' },
+    input: {} as { userId: string },
+  },
+}).createMachine({
+  id: 'onboarding',
+  initial: 'registered',
+  context: ({ input }) => ({
+    userId: input.userId,
+    profileCompleted: false,
+    emailVerified: false,
+    tourCompleted: false,
+  }),
+  states: {
+    registered: {
+      on: { start_onboarding: 'profile_setup' },
+    },
+    profile_setup: {
+      on: {
+        complete_profile: {
+          target: 'email_verification',
+          actions: assign({ profileCompleted: true }),
+        },
+      },
+    },
+    email_verification: {
+      on: {
+        verify_email: {
+          target: 'tour',
+          actions: assign({ emailVerified: true }),
+        },
+        resend_email: {},
+      },
+    },
+    tour: {
+      on: {
+        finish_tour: {
+          target: 'completed',
+          actions: assign({ tourCompleted: true }),
+        },
+        skip_tour: 'completed',
+      },
+    },
+    completed: { type: 'final' },
+  },
+});
+```
+
+```ts
+// With persistence, users resume exactly where they left off:
+@Injectable()
+export class OnboardingService {
+  constructor(
+    @InjectActorFactory('onboarding') private readonly onboarding: ActorFactory,
+  ) {}
+
+  async getProgress(userId: string) {
+    // Restores from persistence if the user left mid-onboarding
+    await this.onboarding.getOrCreate(userId, { input: { userId } });
+    const snapshot = await this.onboarding.getSnapshot(userId);
+    return {
+      currentStep: snapshot?.value,
+      context: snapshot?.context,
+    };
+  }
+
+  async completeProfile(userId: string) {
+    return this.onboarding.send(userId, { type: 'complete_profile' });
+  }
+
+  async verifyEmail(userId: string) {
+    return this.onboarding.send(userId, { type: 'verify_email' });
+  }
+}
 ```
 
 ## API reference
