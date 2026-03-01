@@ -47,13 +47,13 @@
     "@nestjs/core": "^11.0.0",
     "@nestjs/event-emitter": "^3.0.0",
     "@nestjs/testing": "^11.0.0",
-    "@swc/core": "^1.15.11",
-    "@types/node": "^22.0.0",
+    "@swc/core": "^1.15.17",
+    "@types/node": "^25.3.3",
     "reflect-metadata": "^0.2.0",
     "rxjs": "^7.0.0",
     "typescript": "^5.7.0",
     "unplugin-swc": "^1.5.9",
-    "vitest": "^3.0.0",
+    "vitest": "^4.0.18",
     "xstate": "^5.0.0"
   },
   "publishConfig": {
